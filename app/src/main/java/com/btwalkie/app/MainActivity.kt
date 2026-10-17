@@ -8,6 +8,7 @@ import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothServerSocket
 import android.bluetooth.BluetoothSocket
 import android.content.pm.PackageManager
+import android.graphics.Typeface
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioManager
@@ -18,6 +19,8 @@ import android.os.Build
 import android.os.Bundle
 import android.widget.Button
 import android.widget.CheckBox
+import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.TextView
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
@@ -35,6 +38,9 @@ import java.util.UUID
  * One phone "waits for a call" (server), the other "calls a paired phone" (client).
  * After the link is up, each phone streams its microphone to the other phone's
  * speaker. Works only within Bluetooth range.
+ *
+ * The screen is built in code (no layout XML), so this file plus the manifest is all
+ * the app needs.
  */
 @SuppressLint("MissingPermission") // permissions are requested in requirePermissions()
 class MainActivity : AppCompatActivity() {
@@ -79,14 +85,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        setContentView(R.layout.activity_main)
-
-        statusText = findViewById(R.id.statusText)
-        hostButton = findViewById(R.id.hostButton)
-        connectButton = findViewById(R.id.connectButton)
-        hangUpButton = findViewById(R.id.hangUpButton)
-        muteBox = findViewById(R.id.muteBox)
-        speakerBox = findViewById(R.id.speakerBox)
+        buildUi()
 
         audioManager = getSystemService(AUDIO_SERVICE) as AudioManager
         adapter = (getSystemService(BLUETOOTH_SERVICE) as BluetoothManager).adapter
@@ -111,6 +110,71 @@ class MainActivity : AppCompatActivity() {
     override fun onDestroy() {
         endCall("Stopped")
         super.onDestroy()
+    }
+
+    // ---------------------------------------------------------------- screen (built in code)
+
+    private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
+
+    private fun rowParams(topMarginDp: Int): LinearLayout.LayoutParams {
+        val params = LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        )
+        params.topMargin = dp(topMarginDp)
+        return params
+    }
+
+    private fun buildUi() {
+        val column = LinearLayout(this)
+        column.orientation = LinearLayout.VERTICAL
+        column.setPadding(dp(24), dp(24), dp(24), dp(24))
+
+        val title = TextView(this)
+        title.text = "Voice calls over Bluetooth"
+        title.textSize = 22f
+        title.setTypeface(title.typeface, Typeface.BOLD)
+        column.addView(title, rowParams(0))
+
+        val howTo = TextView(this)
+        howTo.text = "1. Pair the two phones first in your phone's Bluetooth settings.\n" +
+            "2. On phone A tap \"Wait for a call\".\n" +
+            "3. On phone B tap \"Call a paired phone\" and pick phone A.\n\n" +
+            "Both phones must stay within Bluetooth range."
+        column.addView(howTo, rowParams(12))
+
+        statusText = TextView(this)
+        statusText.text = "Ready"
+        statusText.textSize = 16f
+        statusText.setTypeface(statusText.typeface, Typeface.BOLD)
+        column.addView(statusText, rowParams(20))
+
+        hostButton = Button(this)
+        hostButton.text = "Wait for a call"
+        column.addView(hostButton, rowParams(20))
+
+        connectButton = Button(this)
+        connectButton.text = "Call a paired phone"
+        column.addView(connectButton, rowParams(8))
+
+        hangUpButton = Button(this)
+        hangUpButton.text = "Hang up"
+        hangUpButton.isEnabled = false
+        column.addView(hangUpButton, rowParams(8))
+
+        muteBox = CheckBox(this)
+        muteBox.text = "Mute my microphone"
+        column.addView(muteBox, rowParams(16))
+
+        speakerBox = CheckBox(this)
+        speakerBox.text = "Use loudspeaker"
+        column.addView(speakerBox, rowParams(0))
+
+        val scroll = ScrollView(this)
+        scroll.isFillViewport = true
+        scroll.keepScreenOn = true
+        scroll.addView(column)
+        setContentView(scroll)
     }
 
     // ---------------------------------------------------------------- permissions
@@ -153,7 +217,11 @@ class MainActivity : AppCompatActivity() {
                 val server = bt.listenUsingRfcommWithServiceRecord("BtWalkie", APP_UUID)
                 serverSocket = server
                 val connected = server.accept() // blocks until the other phone connects
-                try { server.close() } catch (_: IOException) {}
+                try {
+                    server.close()
+                } catch (closeError: IOException) {
+                    // ignore
+                }
                 serverSocket = null
                 beginCall(connected)
             } catch (e: IOException) {
@@ -238,15 +306,19 @@ class MainActivity : AppCompatActivity() {
                     val n = recorder.read(buffer, 0, buffer.size)
                     if (n < 0) break
                     if (n == 0) continue
-                    if (muted) Arrays.fill(buffer, 0, n, 0)
+                    if (muted) Arrays.fill(buffer, 0, n, 0.toByte())
                     out.write(buffer, 0, n)
                 }
-            } catch (_: IOException) {
+            } catch (e: IOException) {
                 // link dropped
-            } catch (_: IllegalStateException) {
+            } catch (e: IllegalStateException) {
                 // recorder stopped
             } finally {
-                try { recorder.stop() } catch (_: IllegalStateException) {}
+                try {
+                    recorder.stop()
+                } catch (e: IllegalStateException) {
+                    // already stopped
+                }
                 recorder.release()
                 endCall("Call ended")
             }
@@ -283,12 +355,16 @@ class MainActivity : AppCompatActivity() {
                 while (inCall && readFully(input, buffer)) {
                     track.write(buffer, 0, buffer.size)
                 }
-            } catch (_: IOException) {
+            } catch (e: IOException) {
                 // link dropped
-            } catch (_: IllegalStateException) {
+            } catch (e: IllegalStateException) {
                 // track stopped
             } finally {
-                try { track.stop() } catch (_: IllegalStateException) {}
+                try {
+                    track.stop()
+                } catch (e: IllegalStateException) {
+                    // already stopped
+                }
                 track.release()
                 endCall("The other phone disconnected.")
             }
@@ -309,9 +385,17 @@ class MainActivity : AppCompatActivity() {
     private fun endCall(message: String) {
         synchronized(this) {
             inCall = false
-            try { socket?.close() } catch (_: IOException) {}
+            try {
+                socket?.close()
+            } catch (e: IOException) {
+                // ignore
+            }
             socket = null
-            try { serverSocket?.close() } catch (_: IOException) {}
+            try {
+                serverSocket?.close()
+            } catch (e: IOException) {
+                // ignore
+            }
             serverSocket = null
             audioManager.isSpeakerphoneOn = false
             audioManager.mode = previousAudioMode
