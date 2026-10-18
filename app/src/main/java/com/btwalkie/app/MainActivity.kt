@@ -3,423 +3,487 @@ package com.btwalkie.app
 import android.Manifest
 import android.annotation.SuppressLint
 import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothClass
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothManager
-import android.bluetooth.BluetoothServerSocket
-import android.bluetooth.BluetoothSocket
+import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.Color
 import android.graphics.Typeface
-import android.media.AudioAttributes
-import android.media.AudioFormat
+import android.graphics.drawable.GradientDrawable
 import android.media.AudioManager
-import android.media.AudioRecord
-import android.media.AudioTrack
-import android.media.MediaRecorder
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
-import android.widget.Button
-import android.widget.CheckBox
+import android.os.Handler
+import android.os.Looper
+import android.os.PowerManager
+import android.provider.Settings
+import android.view.Gravity
+import android.view.View
+import android.view.ViewGroup
+import android.view.WindowManager
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
-import java.io.IOException
-import java.io.InputStream
-import java.io.OutputStream
-import java.util.Arrays
-import java.util.UUID
 
 /**
- * Two-way voice over a direct Bluetooth (RFCOMM) link between two paired phones.
- *
- * One phone "waits for a call" (server), the other "calls a paired phone" (client).
- * After the link is up, each phone streams its microphone to the other phone's
- * speaker. Works only within Bluetooth range.
- *
- * The screen is built in code (no layout XML), so this file plus the manifest is all
- * the app needs.
+ * The screens: Home (list of paired phones with a Call button) and the Call screen
+ * (calling / incoming / talking). Everything is drawn in code; the actual calling is
+ * done by CallService so it keeps working when this screen is closed or the phone is locked.
  */
-@SuppressLint("MissingPermission") // permissions are requested in requirePermissions()
+@SuppressLint("MissingPermission")
 class MainActivity : AppCompatActivity() {
 
     companion object {
-        // Both phones must use the same UUID. Any random UUID works.
-        private val APP_UUID: UUID = UUID.fromString("8ce255c0-200a-11e0-ac64-0800200c9a66")
-        private const val SAMPLE_RATE = 16000
-        private const val CHUNK_BYTES = 640 // 20 ms of 16-bit mono audio
+        const val EXTRA_ACCEPT = "accept_call"
+        private const val MATCH = ViewGroup.LayoutParams.MATCH_PARENT
+        private const val WRAP = ViewGroup.LayoutParams.WRAP_CONTENT
     }
 
-    private lateinit var statusText: TextView
-    private lateinit var hostButton: Button
-    private lateinit var connectButton: Button
-    private lateinit var hangUpButton: Button
-    private lateinit var muteBox: CheckBox
-    private lateinit var speakerBox: CheckBox
+    private val colorBg = Color.parseColor("#0F1417")
+    private val colorCard = Color.parseColor("#1A2126")
+    private val colorAccent = Color.parseColor("#00BFA5")
+    private val colorDanger = Color.parseColor("#E53935")
+    private val colorMuted = Color.parseColor("#9AA7B0")
+    private val colorAmber = Color.parseColor("#FFB300")
+    private val colorOff = Color.parseColor("#2A343B")
 
-    private lateinit var audioManager: AudioManager
-    private var adapter: BluetoothAdapter? = null
+    private val ui = Handler(Looper.getMainLooper())
+    private val listener: () -> Unit = { render() }
+    private var timerView: TextView? = null
 
-    private var serverSocket: BluetoothServerSocket? = null
-    private var socket: BluetoothSocket? = null
-
-    @Volatile private var inCall = false
-    @Volatile private var muted = false
-    @Volatile private var speakerOn = false
-
-    private var previousAudioMode = AudioManager.MODE_NORMAL
-    private var pendingAction: (() -> Unit)? = null
+    private val tick = object : Runnable {
+        override fun run() {
+            updateTimer()
+            ui.postDelayed(this, 1000)
+        }
+    }
 
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
-    ) { result ->
-        if (result.values.all { it }) {
-            pendingAction?.invoke()
-        } else {
-            setStatus("Permission denied. The app needs microphone and Bluetooth access.")
-        }
-        pendingAction = null
+    ) {
+        startEngine()
+        render()
     }
+
+    // ---------------------------------------------------------------- lifecycle
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        buildUi()
-
-        audioManager = getSystemService(AUDIO_SERVICE) as AudioManager
-        adapter = (getSystemService(BLUETOOTH_SERVICE) as BluetoothManager).adapter
-
-        if (adapter == null) {
-            setStatus("This phone has no Bluetooth.")
-            hostButton.isEnabled = false
-            connectButton.isEnabled = false
-        }
-
-        muteBox.setOnCheckedChangeListener { _, checked -> muted = checked }
-        speakerBox.setOnCheckedChangeListener { _, checked ->
-            speakerOn = checked
-            if (inCall) audioManager.isSpeakerphoneOn = checked
-        }
-
-        hostButton.setOnClickListener { requirePermissions { startHosting() } }
-        connectButton.setOnClickListener { requirePermissions { showDevicePicker() } }
-        hangUpButton.setOnClickListener { endCall("Call ended") }
+        volumeControlStream = AudioManager.STREAM_VOICE_CALL // volume keys change call volume
+        window.statusBarColor = colorBg
+        window.navigationBarColor = colorBg
+        handleIntent(intent)
+        ensurePermissions()
+        render()
     }
 
-    override fun onDestroy() {
-        endCall("Stopped")
-        super.onDestroy()
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleIntent(intent)
     }
 
-    // ---------------------------------------------------------------- screen (built in code)
-
-    private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
-
-    private fun rowParams(topMarginDp: Int): LinearLayout.LayoutParams {
-        val params = LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT,
-            LinearLayout.LayoutParams.WRAP_CONTENT
-        )
-        params.topMargin = dp(topMarginDp)
-        return params
+    override fun onStart() {
+        super.onStart()
+        CallHub.addListener(listener)
+        ui.removeCallbacks(tick)
+        ui.post(tick)
+        render()
     }
 
-    private fun buildUi() {
-        val column = LinearLayout(this)
-        column.orientation = LinearLayout.VERTICAL
-        column.setPadding(dp(24), dp(24), dp(24), dp(24))
-
-        val title = TextView(this)
-        title.text = "Voice calls over Bluetooth"
-        title.textSize = 22f
-        title.setTypeface(title.typeface, Typeface.BOLD)
-        column.addView(title, rowParams(0))
-
-        val howTo = TextView(this)
-        howTo.text = "1. Pair the two phones first in your phone's Bluetooth settings.\n" +
-            "2. On phone A tap \"Wait for a call\".\n" +
-            "3. On phone B tap \"Call a paired phone\" and pick phone A.\n\n" +
-            "Both phones must stay within Bluetooth range."
-        column.addView(howTo, rowParams(12))
-
-        statusText = TextView(this)
-        statusText.text = "Ready"
-        statusText.textSize = 16f
-        statusText.setTypeface(statusText.typeface, Typeface.BOLD)
-        column.addView(statusText, rowParams(20))
-
-        hostButton = Button(this)
-        hostButton.text = "Wait for a call"
-        column.addView(hostButton, rowParams(20))
-
-        connectButton = Button(this)
-        connectButton.text = "Call a paired phone"
-        column.addView(connectButton, rowParams(8))
-
-        hangUpButton = Button(this)
-        hangUpButton.text = "Hang up"
-        hangUpButton.isEnabled = false
-        column.addView(hangUpButton, rowParams(8))
-
-        muteBox = CheckBox(this)
-        muteBox.text = "Mute my microphone"
-        column.addView(muteBox, rowParams(16))
-
-        speakerBox = CheckBox(this)
-        speakerBox.text = "Use loudspeaker"
-        column.addView(speakerBox, rowParams(0))
-
-        val scroll = ScrollView(this)
-        scroll.isFillViewport = true
-        scroll.keepScreenOn = true
-        scroll.addView(column)
-        setContentView(scroll)
+    override fun onStop() {
+        CallHub.removeListener(listener)
+        ui.removeCallbacks(tick)
+        super.onStop()
     }
 
-    // ---------------------------------------------------------------- permissions
-
-    private fun requirePermissions(action: () -> Unit) {
-        val needed = mutableListOf(Manifest.permission.RECORD_AUDIO)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            needed.add(Manifest.permission.BLUETOOTH_CONNECT)
+    private fun handleIntent(intent: Intent?) {
+        if (intent != null && intent.getBooleanExtra(EXTRA_ACCEPT, false)) {
+            intent.removeExtra(EXTRA_ACCEPT)
+            sendToService(CallService.ACTION_ACCEPT, null)
         }
-        val missing = needed.filter {
-            ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
-        }
+    }
+
+    // ---------------------------------------------------------------- permissions and service
+
+    private fun granted(permission: String): Boolean =
+        ContextCompat.checkSelfPermission(this, permission) == PackageManager.PERMISSION_GRANTED
+
+    private fun hasBtPermission(): Boolean =
+        Build.VERSION.SDK_INT < 31 || granted(Manifest.permission.BLUETOOTH_CONNECT)
+
+    private fun ensurePermissions() {
+        val wanted = mutableListOf(Manifest.permission.RECORD_AUDIO)
+        if (Build.VERSION.SDK_INT >= 31) wanted.add(Manifest.permission.BLUETOOTH_CONNECT)
+        if (Build.VERSION.SDK_INT >= 33) wanted.add(Manifest.permission.POST_NOTIFICATIONS)
+        val missing = wanted.filter { !granted(it) }
         if (missing.isEmpty()) {
-            action()
+            startEngine()
         } else {
-            pendingAction = action
             permissionLauncher.launch(missing.toTypedArray())
         }
     }
 
-    // ---------------------------------------------------------------- connecting
-
-    private fun bluetoothReady(): BluetoothAdapter? {
-        val bt = adapter
-        if (bt == null || !bt.isEnabled) {
-            setStatus("Turn Bluetooth on first.")
-            return null
+    /** Starts the background service that waits for incoming calls. */
+    private fun startEngine() {
+        if (CallHub.isEnabled(this) && hasBtPermission()) {
+            sendToService(CallService.ACTION_START, null)
         }
-        return bt
     }
 
-    private fun startHosting() {
-        val bt = bluetoothReady() ?: return
-        if (inCall) return
-        showBusyButtons()
-        setStatus("Waiting for the other phone to call...")
-
-        Thread {
-            try {
-                val server = bt.listenUsingRfcommWithServiceRecord("BtWalkie", APP_UUID)
-                serverSocket = server
-                val connected = server.accept() // blocks until the other phone connects
-                try {
-                    server.close()
-                } catch (closeError: IOException) {
-                    // ignore
-                }
-                serverSocket = null
-                beginCall(connected)
-            } catch (e: IOException) {
-                // If the user pressed Hang up, serverSocket is already null and the UI is reset.
-                if (serverSocket != null) endCall("Could not start waiting for a call.")
-            }
-        }.start()
+    private fun sendToService(action: String, address: String?) {
+        val i = Intent(this, CallService::class.java)
+        i.action = action
+        if (address != null) i.putExtra(CallService.EXTRA_ADDRESS, address)
+        try {
+            ContextCompat.startForegroundService(this, i)
+        } catch (e: Exception) {
+            toast("Could not start. Open the app again.")
+        }
     }
 
-    private fun showDevicePicker() {
-        val bt = bluetoothReady() ?: return
-        if (inCall) return
-        val paired: List<BluetoothDevice> = bt.bondedDevices.toList()
-        if (paired.isEmpty()) {
-            setStatus("No paired phones. Pair them in Bluetooth settings first.")
+    private fun bluetoothAdapter(): BluetoothAdapter? =
+        (getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager).adapter
+
+    private fun toast(message: String) {
+        Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
+    }
+
+    private fun startCall(device: BluetoothDevice) {
+        if (!granted(Manifest.permission.RECORD_AUDIO) || !hasBtPermission()) {
+            toast("Please allow the permissions first.")
+            ensurePermissions()
             return
         }
-        val names = paired.map { it.name ?: it.address }.toTypedArray()
-        AlertDialog.Builder(this)
-            .setTitle("Call which phone?")
-            .setItems(names) { _, index -> connectTo(paired[index]) }
-            .setNegativeButton("Cancel", null)
-            .show()
-    }
-
-    private fun connectTo(device: BluetoothDevice) {
-        if (inCall) return
-        showBusyButtons()
-        setStatus("Calling ${device.name ?: device.address}...")
-
-        Thread {
-            try {
-                val s = device.createRfcommSocketToServiceRecord(APP_UUID)
-                s.connect()
-                beginCall(s)
-            } catch (e: IOException) {
-                endCall("Could not connect. Is the other phone waiting for a call?")
-            }
-        }.start()
-    }
-
-    // ---------------------------------------------------------------- the call
-
-    private fun beginCall(connected: BluetoothSocket) {
-        socket = connected
-        inCall = true
-
-        previousAudioMode = audioManager.mode
-        audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
-        audioManager.isSpeakerphoneOn = speakerOn
-
-        setStatus("Connected to ${connected.remoteDevice.name ?: connected.remoteDevice.address}")
-        runOnUiThread { showBusyButtons() }
-
-        startSender(connected.outputStream)
-        startReceiver(connected.inputStream)
-    }
-
-    /** Microphone -> Bluetooth. */
-    private fun startSender(out: OutputStream) {
-        Thread {
-            val minBuf = AudioRecord.getMinBufferSize(
-                SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT
-            )
-            val recorder = AudioRecord(
-                MediaRecorder.AudioSource.VOICE_COMMUNICATION, // enables echo cancellation where supported
-                SAMPLE_RATE,
-                AudioFormat.CHANNEL_IN_MONO,
-                AudioFormat.ENCODING_PCM_16BIT,
-                maxOf(minBuf, CHUNK_BYTES * 4)
-            )
-            if (recorder.state != AudioRecord.STATE_INITIALIZED) {
-                recorder.release()
-                endCall("Could not open the microphone.")
-                return@Thread
-            }
-
-            val buffer = ByteArray(CHUNK_BYTES)
-            try {
-                recorder.startRecording()
-                while (inCall) {
-                    val n = recorder.read(buffer, 0, buffer.size)
-                    if (n < 0) break
-                    if (n == 0) continue
-                    if (muted) Arrays.fill(buffer, 0, n, 0.toByte())
-                    out.write(buffer, 0, n)
-                }
-            } catch (e: IOException) {
-                // link dropped
-            } catch (e: IllegalStateException) {
-                // recorder stopped
-            } finally {
-                try {
-                    recorder.stop()
-                } catch (e: IllegalStateException) {
-                    // already stopped
-                }
-                recorder.release()
-                endCall("Call ended")
-            }
-        }.start()
-    }
-
-    /** Bluetooth -> speaker. */
-    private fun startReceiver(input: InputStream) {
-        Thread {
-            val minBuf = AudioTrack.getMinBufferSize(
-                SAMPLE_RATE, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT
-            )
-            val track = AudioTrack.Builder()
-                .setAudioAttributes(
-                    AudioAttributes.Builder()
-                        .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
-                        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                        .build()
-                )
-                .setAudioFormat(
-                    AudioFormat.Builder()
-                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                        .setSampleRate(SAMPLE_RATE)
-                        .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
-                        .build()
-                )
-                .setBufferSizeInBytes(maxOf(minBuf, CHUNK_BYTES * 4))
-                .setTransferMode(AudioTrack.MODE_STREAM)
-                .build()
-
-            val buffer = ByteArray(CHUNK_BYTES)
-            try {
-                track.play()
-                while (inCall && readFully(input, buffer)) {
-                    track.write(buffer, 0, buffer.size)
-                }
-            } catch (e: IOException) {
-                // link dropped
-            } catch (e: IllegalStateException) {
-                // track stopped
-            } finally {
-                try {
-                    track.stop()
-                } catch (e: IllegalStateException) {
-                    // already stopped
-                }
-                track.release()
-                endCall("The other phone disconnected.")
-            }
-        }.start()
-    }
-
-    /** Reads exactly buffer.size bytes so audio samples never get split. */
-    private fun readFully(input: InputStream, buffer: ByteArray): Boolean {
-        var offset = 0
-        while (offset < buffer.size) {
-            val n = input.read(buffer, offset, buffer.size - offset)
-            if (n < 0) return false
-            offset += n
+        val bt = bluetoothAdapter()
+        if (bt == null || !bt.isEnabled) {
+            toast("Turn Bluetooth on first.")
+            return
         }
-        return true
+        sendToService(CallService.ACTION_CALL, device.address)
     }
 
-    private fun endCall(message: String) {
-        synchronized(this) {
-            inCall = false
-            try {
-                socket?.close()
-            } catch (e: IOException) {
-                // ignore
-            }
-            socket = null
-            try {
-                serverSocket?.close()
-            } catch (e: IOException) {
-                // ignore
-            }
-            serverSocket = null
-            audioManager.isSpeakerphoneOn = false
-            audioManager.mode = previousAudioMode
+    // ---------------------------------------------------------------- drawing helpers
+
+    private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
+
+    private fun rounded(color: Int, radiusDp: Int): GradientDrawable {
+        val d = GradientDrawable()
+        d.setColor(color)
+        d.cornerRadius = dp(radiusDp).toFloat()
+        return d
+    }
+
+    private fun lp(width: Int, height: Int, topDp: Int, weight: Float): LinearLayout.LayoutParams {
+        val p = if (weight > 0f) {
+            LinearLayout.LayoutParams(width, height, weight)
+        } else {
+            LinearLayout.LayoutParams(width, height)
         }
-        setStatus(message)
-        runOnUiThread { showIdleButtons() }
+        p.topMargin = dp(topDp)
+        return p
     }
 
-    // ---------------------------------------------------------------- UI helpers
-
-    private fun setStatus(text: String) {
-        runOnUiThread { statusText.text = text }
+    private fun label(value: String, sizeSp: Float, color: Int, bold: Boolean): TextView {
+        val t = TextView(this)
+        t.text = value
+        t.textSize = sizeSp
+        t.setTextColor(color)
+        if (bold) t.setTypeface(t.typeface, Typeface.BOLD)
+        return t
     }
 
-    private fun showBusyButtons() {
-        hostButton.isEnabled = false
-        connectButton.isEnabled = false
-        hangUpButton.isEnabled = true
+    private fun pill(text: String, background: Int, textColor: Int, onClick: () -> Unit): TextView {
+        val t = label(text, 16f, textColor, true)
+        t.gravity = Gravity.CENTER
+        t.setPadding(dp(22), dp(14), dp(22), dp(14))
+        t.background = rounded(background, 28)
+        t.isClickable = true
+        t.setOnClickListener { onClick() }
+        return t
     }
 
-    private fun showIdleButtons() {
-        val hasBluetooth = adapter != null
-        hostButton.isEnabled = hasBluetooth
-        connectButton.isEnabled = hasBluetooth
-        hangUpButton.isEnabled = false
+    private fun initialOf(name: String): String {
+        val c = name.trim().firstOrNull() ?: return "?"
+        return c.uppercaseChar().toString()
+    }
+
+    private fun avatar(name: String, sizeDp: Int, textSp: Float): TextView {
+        val t = label(initialOf(name), textSp, Color.WHITE, true)
+        t.gravity = Gravity.CENTER
+        val circle = GradientDrawable()
+        circle.shape = GradientDrawable.OVAL
+        circle.setColor(colorAccent)
+        t.background = circle
+        t.layoutParams = LinearLayout.LayoutParams(dp(sizeDp), dp(sizeDp))
+        return t
+    }
+
+    // ---------------------------------------------------------------- screens
+
+    private fun render() {
+        timerView = null
+        if (CallHub.phase == Phase.IDLE) {
+            window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            setContentView(buildHome())
+        } else {
+            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            setContentView(buildCallScreen())
+            updateTimer()
+        }
+    }
+
+    private fun buildHome(): View {
+        val scroll = ScrollView(this)
+        scroll.setBackgroundColor(colorBg)
+        scroll.isFillViewport = true
+
+        val col = LinearLayout(this)
+        col.orientation = LinearLayout.VERTICAL
+        col.setPadding(dp(20), dp(32), dp(20), dp(28))
+
+        col.addView(label("BT Walkie", 30f, Color.WHITE, true), lp(MATCH, WRAP, 0, 0f))
+        col.addView(
+            label("Talk over Bluetooth. No internet, no SIM.", 15f, colorMuted, false),
+            lp(MATCH, WRAP, 4, 0f)
+        )
+
+        // Status
+        val bt = bluetoothAdapter()
+        val enabled = CallHub.isEnabled(this)
+        val statusText: String
+        val statusColor: Int
+        if (!hasBtPermission()) {
+            statusText = "Permission needed. Tap here to allow."
+            statusColor = colorAmber
+        } else if (bt == null) {
+            statusText = "This phone has no Bluetooth."
+            statusColor = colorDanger
+        } else if (!bt.isEnabled) {
+            statusText = "Bluetooth is off. Turn it on to call or receive calls."
+            statusColor = colorDanger
+        } else if (!enabled) {
+            statusText = "Receiving calls is turned off."
+            statusColor = colorAmber
+        } else if (CallHub.listening) {
+            statusText = "Ready to receive calls"
+            statusColor = colorAccent
+        } else {
+            statusText = "Starting..."
+            statusColor = colorMuted
+        }
+        val status = label(statusText, 15f, statusColor, true)
+        status.setPadding(dp(16), dp(12), dp(16), dp(12))
+        status.background = rounded(colorCard, 16)
+        status.setOnClickListener {
+            if (!hasBtPermission() || !granted(Manifest.permission.RECORD_AUDIO)) ensurePermissions()
+        }
+        col.addView(status, lp(MATCH, WRAP, 20, 0f))
+
+        if (CallHub.message.isNotEmpty()) {
+            val msg = label(CallHub.message, 15f, Color.WHITE, false)
+            msg.setPadding(dp(16), dp(12), dp(16), dp(12))
+            msg.background = rounded(colorOff, 16)
+            col.addView(msg, lp(MATCH, WRAP, 10, 0f))
+        }
+
+        // Paired phones
+        col.addView(label("Paired phones", 14f, colorMuted, true), lp(MATCH, WRAP, 26, 0f))
+        val devices: List<BluetoothDevice> =
+            if (bt != null && hasBtPermission()) {
+                bt.bondedDevices.sortedBy {
+                    if (it.bluetoothClass?.majorDeviceClass == BluetoothClass.Device.Major.PHONE) 0 else 1
+                }
+            } else {
+                emptyList()
+            }
+        if (devices.isEmpty()) {
+            col.addView(
+                label(
+                    "No paired phones yet. Pair both phones in Bluetooth settings first, then come back here.",
+                    15f, Color.WHITE, false
+                ),
+                lp(MATCH, WRAP, 10, 0f)
+            )
+        }
+        for (d in devices) {
+            val name = d.name ?: d.address
+            val row = LinearLayout(this)
+            row.orientation = LinearLayout.HORIZONTAL
+            row.gravity = Gravity.CENTER_VERTICAL
+            row.background = rounded(colorCard, 20)
+            row.setPadding(dp(14), dp(12), dp(14), dp(12))
+            row.addView(avatar(name, 44, 18f))
+
+            val names = LinearLayout(this)
+            names.orientation = LinearLayout.VERTICAL
+            names.addView(label(name, 16f, Color.WHITE, true))
+            names.addView(label(d.address, 12f, colorMuted, false))
+            val namesParams = lp(0, WRAP, 0, 1f)
+            namesParams.leftMargin = dp(12)
+            row.addView(names, namesParams)
+
+            row.addView(pill("Call", colorAccent, Color.WHITE) { startCall(d) })
+            col.addView(row, lp(MATCH, WRAP, 10, 0f))
+        }
+
+        // Settings
+        col.addView(
+            pill("Bluetooth settings", colorOff, Color.WHITE) {
+                startActivity(Intent(Settings.ACTION_BLUETOOTH_SETTINGS))
+            },
+            lp(MATCH, WRAP, 22, 0f)
+        )
+        col.addView(
+            pill(
+                if (enabled) "Turn off receiving calls" else "Turn on receiving calls",
+                colorOff, Color.WHITE
+            ) {
+                if (enabled) {
+                    CallHub.setEnabled(this, false)
+                    sendToService(CallService.ACTION_STOP, null)
+                } else {
+                    CallHub.setEnabled(this, true)
+                    ensurePermissions()
+                    startEngine()
+                }
+                render()
+            },
+            lp(MATCH, WRAP, 10, 0f)
+        )
+        val power = getSystemService(Context.POWER_SERVICE) as PowerManager
+        if (Build.VERSION.SDK_INT >= 23 && !power.isIgnoringBatteryOptimizations(packageName)) {
+            col.addView(
+                pill("Allow running in background", colorOff, Color.WHITE) { askBatteryException() },
+                lp(MATCH, WRAP, 10, 0f)
+            )
+        }
+
+        col.addView(
+            label(
+                "Tip: keep Bluetooth on. The other phone rings even if this app is closed or the screen is off. " +
+                    "Range is about 10 metres.",
+                13f, colorMuted, false
+            ),
+            lp(MATCH, WRAP, 22, 0f)
+        )
+
+        scroll.addView(col)
+        return scroll
+    }
+
+    @SuppressLint("BatteryLife")
+    private fun askBatteryException() {
+        try {
+            val i = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
+            i.data = Uri.parse("package:$packageName")
+            startActivity(i)
+        } catch (e: Exception) {
+            try {
+                startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+            } catch (e2: Exception) {
+                toast("Open Settings > Battery and allow BT Walkie to run in background.")
+            }
+        }
+    }
+
+    private fun buildCallScreen(): View {
+        val phase = CallHub.phase
+        val col = LinearLayout(this)
+        col.orientation = LinearLayout.VERTICAL
+        col.gravity = Gravity.CENTER_HORIZONTAL
+        col.setBackgroundColor(colorBg)
+        col.setPadding(dp(24), dp(72), dp(24), dp(44))
+
+        val name = CallHub.peerName
+        col.addView(avatar(name, 124, 54f))
+
+        val nameView = label(name, 28f, Color.WHITE, true)
+        nameView.gravity = Gravity.CENTER
+        col.addView(nameView, lp(MATCH, WRAP, 24, 0f))
+
+        val statusLine = when (phase) {
+            Phase.OUTGOING -> "Calling..."
+            Phase.INCOMING -> "Incoming call"
+            else -> "00:00"
+        }
+        val statusView = label(statusLine, 18f, colorMuted, false)
+        statusView.gravity = Gravity.CENTER
+        col.addView(statusView, lp(MATCH, WRAP, 8, 0f))
+        if (phase == Phase.ACTIVE) timerView = statusView
+
+        // Pushes the buttons to the bottom.
+        col.addView(View(this), lp(1, 0, 0, 1f))
+
+        if (phase == Phase.ACTIVE) {
+            val controls = LinearLayout(this)
+            controls.orientation = LinearLayout.HORIZONTAL
+            val muteBtn = pill(
+                if (CallHub.muted) "Unmute" else "Mute",
+                if (CallHub.muted) colorAmber else colorOff,
+                if (CallHub.muted) Color.BLACK else Color.WHITE
+            ) {
+                CallHub.muted = !CallHub.muted
+                CallHub.changed()
+            }
+            val speakerBtn = pill(
+                if (CallHub.speaker) "Speaker on" else "Speaker",
+                if (CallHub.speaker) colorAccent else colorOff,
+                Color.WHITE
+            ) {
+                CallHub.speaker = !CallHub.speaker
+                val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                am.isSpeakerphoneOn = CallHub.speaker
+                CallHub.changed()
+            }
+            val left = lp(0, WRAP, 0, 1f)
+            left.rightMargin = dp(8)
+            val right = lp(0, WRAP, 0, 1f)
+            right.leftMargin = dp(8)
+            controls.addView(muteBtn, left)
+            controls.addView(speakerBtn, right)
+            col.addView(controls, lp(MATCH, WRAP, 0, 0f))
+        }
+
+        if (phase == Phase.INCOMING) {
+            val row = LinearLayout(this)
+            row.orientation = LinearLayout.HORIZONTAL
+            val decline = pill("Decline", colorDanger, Color.WHITE) {
+                sendToService(CallService.ACTION_REJECT, null)
+            }
+            val accept = pill("Accept", colorAccent, Color.WHITE) {
+                sendToService(CallService.ACTION_ACCEPT, null)
+            }
+            val left = lp(0, WRAP, 0, 1f)
+            left.rightMargin = dp(8)
+            val right = lp(0, WRAP, 0, 1f)
+            right.leftMargin = dp(8)
+            row.addView(decline, left)
+            row.addView(accept, right)
+            col.addView(row, lp(MATCH, WRAP, 16, 0f))
+        } else {
+            col.addView(
+                pill("Hang up", colorDanger, Color.WHITE) {
+                    sendToService(CallService.ACTION_HANGUP, null)
+                },
+                lp(MATCH, WRAP, 16, 0f)
+            )
+        }
+        return col
+    }
+
+    private fun updateTimer() {
+        val tv = timerView ?: return
+        val start = CallHub.startedAt
+        if (CallHub.phase != Phase.ACTIVE || start == 0L) return
+        val seconds = ((System.currentTimeMillis() - start) / 1000).toInt()
+        tv.text = String.format("%02d:%02d", seconds / 60, seconds % 60)
     }
 }

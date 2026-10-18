@@ -24,7 +24,14 @@ jobs:
           gradle-version: 8.7
 
       - name: Build the debug APK
-        run: gradle assembleDebug --no-daemon
+        run: |
+          set -o pipefail
+          gradle assembleDebug --no-daemon --console=plain 2>&1 | tee build.log
+
+      - name: Show build errors
+        if: failure()
+        run: |
+          grep -E -A1 "^e: |error:|What went wrong|Execution failed|AAPT" build.log | head -60 | while IFS= read -r line; do echo "::error::$line"; done
 
       - name: Save the APK so it can be downloaded
         uses: actions/upload-artifact@v4

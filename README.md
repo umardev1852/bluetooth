@@ -1,31 +1,30 @@
 # BT Walkie
 
-Two-way voice calls between two Android phones over a direct Bluetooth link.
-No SIM, no Wi-Fi, no internet. It only works while the phones are within Bluetooth range
-(roughly 10 m indoors, more in open space).
+Voice calls between two Android phones over a direct Bluetooth link.
+No SIM, no Wi-Fi, no internet. Works within Bluetooth range (about 10 m indoors).
 
-## Build it
+## How to use
 
-1. Unzip the project and open the `BtWalkie` folder in Android Studio (File > Open).
-2. Wait for Gradle sync to finish (it downloads what it needs on first run).
-3. Plug in an Android phone with USB debugging on and press Run, or use
-   Build > Build APK(s) to get an APK you can copy to both phones.
+1. Install the APK on both phones and open the app once. Allow the microphone,
+   "Nearby devices" and notification permissions.
+2. Pair the two phones in Settings > Bluetooth (only needed once).
+3. Keep Bluetooth on. On one phone, open the app and tap **Call** next to the other phone.
+4. The other phone rings (even if the app is closed or the screen is off) and shows
+   **Accept** / **Decline**.
+5. During a call: Mute, Speaker, Hang up. The call keeps going when the screen turns off.
 
-Install the app on BOTH phones.
+Tip: tap "Allow running in background" in the app so the phone does not stop the app to save battery.
 
-## Use it
+## What is inside
 
-1. On both phones, pair them in Settings > Bluetooth.
-2. Open BT Walkie on both and allow the microphone and Bluetooth permissions.
-3. Phone A: tap "Wait for a call".
-4. Phone B: tap "Call a paired phone" and choose phone A.
-5. Talk. Use "Mute" or "Use loudspeaker" as needed. Tap "Hang up" to stop.
+- `CallService` - background service: waits for calls, rings, handshake (accept / decline / busy),
+  voice in both directions (16 kHz, u-law compressed, 20 ms frames, jitter buffer, echo
+  cancel / noise reduction where the phone supports them).
+- `MainActivity` - the screens (paired phones list, calling, incoming, in-call).
+- `CallHub` - shared state between the service and the screens.
+- `BootReceiver` - starts waiting for calls again after the phone restarts.
 
-## Notes and limits
+## Build
 
-- Keep the app open and the screen on during a call (the screen stays on automatically).
-- Without headphones, hold the phone to your ear (default) or use loudspeaker.
-  Loudspeaker can cause echo on some phones.
-- Not a normal phone call: it does not use your number or the phone dialer.
-- Ideas for next steps: run the call in a foreground service so it survives the screen
-  turning off, add a ringing sound, add audio compression (Opus), add a nicer design.
+GitHub builds the APK automatically on every push (Actions tab > latest run > Artifacts).
+The APK is signed with a fixed key (`app/debug.keystore`), so a new version installs over the old one.
