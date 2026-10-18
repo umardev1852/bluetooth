@@ -30,6 +30,7 @@ import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 
@@ -59,6 +60,10 @@ class MainActivity : AppCompatActivity() {
     private val listener: () -> Unit = { render() }
     private var timerView: TextView? = null
     private var showLog = false
+
+    // Long range: the phones in the middle chosen so far. The first one is paired with THIS phone.
+    private val chain = ArrayList<Protocol.Peer>()
+    private var listRequest: RelayClient.Request? = null
 
     private val tick = object : Runnable {
         override fun run() {
@@ -144,7 +149,6 @@ class MainActivity : AppCompatActivity() {
     private fun sendToService(action: String, address: String?) {
         val i = Intent(this, CallService::class.java)
         i.action = action
-        if (address != null) i.putExtra(CallService.EXTRA_ADDRESS, address)
         try {
             ContextCompat.startForegroundService(this, i)
         } catch (e: Exception) {
@@ -170,7 +174,108 @@ class MainActivity : AppCompatActivity() {
             toast("Turn Bluetooth on first.")
             return
         }
-        sendToService(CallService.ACTION_CALL, device.address)
+        sendCall(listOf(device.address), listOf(device.name ?: device.address))
+    }
+
+    /** [route] is the list of phones to go through; the last one is the phone to talk to. */
+    private fun sendCall(route: List<String>, names: List<String>) {
+        val i = Intent(this, CallService::class.java)
+        i.action = CallService.ACTION_CALL
+        i.putExtra(CallService.EXTRA_ROUTE, route.toTypedArray())
+        i.putExtra(CallService.EXTRA_NAMES, names.toTypedArray())
+        try {
+            ContextCompat.startForegroundService(this, i)
+        } catch (e: Exception) {
+            toast("Could not start. Open the app again.")
+        }
+    }
+
+    // ---------------------------------------------------------------- long range (through other phones)
+
+    private fun startLongRange() {
+        if (!granted(Manifest.permission.RECORD_AUDIO) || !hasBtPermission()) {
+            toast("Please allow the permissions first.")
+            ensurePermissions()
+            return
+        }
+        val bt = bluetoothAdapter()
+        if (bt == null || !bt.isEnabled) {
+            toast("Turn Bluetooth on first.")
+            return
+        }
+        val paired = bt.bondedDevices.toList()
+        if (paired.isEmpty()) {
+            toast("No paired phones yet.")
+            return
+        }
+        val names = paired.map { it.name ?: it.address }.toTypedArray()
+        AlertDialog.Builder(this)
+            .setTitle("Which phone is in the middle?")
+            .setItems(names) { _, index ->
+                chain.clear()
+                chain.add(Protocol.Peer(names[index], paired[index].address))
+                askForPhones()
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    /** Asks the last phone of the chain which phones it is paired with. */
+    private fun askForPhones() {
+        val middle = chain.last().name
+        val dialog = AlertDialog.Builder(this)
+            .setTitle("Please wait")
+            .setMessage("Asking " + middle + " which phones it is paired with...")
+            .setNegativeButton("Cancel") { _, _ -> listRequest?.cancel() }
+            .setCancelable(false)
+            .create()
+        dialog.show()
+        listRequest = RelayClient.listPeers(this, chain.map { it.address }) { peers, error ->
+            dialog.dismiss()
+            if (peers == null) {
+                CallHub.message = error
+                CallHub.changed()
+            } else {
+                showPeerPicker(peers)
+            }
+        }
+    }
+
+    private fun showPeerPicker(peers: List<Protocol.Peer>) {
+        val here = chain.last().name
+        if (peers.isEmpty()) {
+            CallHub.message = here + " has no other paired phones. Pair it with the phone you want to reach first."
+            CallHub.changed()
+            return
+        }
+        val names = peers.map { it.name }.toTypedArray()
+        AlertDialog.Builder(this)
+            .setTitle("Phones paired with " + here)
+            .setItems(names) { _, index -> choosePeerAction(peers[index]) }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun choosePeerAction(peer: Protocol.Peer) {
+        val path = chain.joinToString(" > ") { it.name } + " > " + peer.name
+        val builder = AlertDialog.Builder(this)
+            .setTitle(peer.name)
+            .setMessage("Call through: " + path + "\n\nEvery extra phone adds a little delay.")
+            .setPositiveButton("Call") { _, _ -> startRelayedCall(peer) }
+            .setNegativeButton("Cancel", null)
+        if (chain.size < Protocol.MAX_ROUTE - 1) {
+            builder.setNeutralButton("Go further") { _, _ ->
+                chain.add(peer)
+                askForPhones()
+            }
+        }
+        builder.show()
+    }
+
+    private fun startRelayedCall(target: Protocol.Peer) {
+        val route = chain.map { it.address } + target.address
+        val names = chain.map { it.name } + target.name
+        sendCall(route, names)
     }
 
     // ---------------------------------------------------------------- drawing helpers
@@ -337,6 +442,20 @@ class MainActivity : AppCompatActivity() {
             col.addView(row, lp(MATCH, WRAP, 10, 0f))
         }
 
+        // Long range
+        col.addView(
+            pill("Long range: call through another phone", colorOff, Color.WHITE) { startLongRange() },
+            lp(MATCH, WRAP, 18, 0f)
+        )
+        col.addView(
+            label(
+                "Phone too far? Use a phone in between that is paired with both of you. It passes the call along. " +
+                    "All of you need the newest BT Walkie.",
+                12f, colorMuted, false
+            ),
+            lp(MATCH, WRAP, 6, 0f)
+        )
+
         // Settings
         col.addView(
             pill("Bluetooth settings", colorOff, Color.WHITE) {
@@ -461,10 +580,16 @@ class MainActivity : AppCompatActivity() {
         val nameView = label(name, 28f, Color.WHITE, true)
         nameView.gravity = Gravity.CENTER
         col.addView(nameView, lp(MATCH, WRAP, 24, 0f))
+        if (CallHub.via.isNotEmpty()) {
+            val viaView = label(CallHub.via, 14f, colorMuted, false)
+            viaView.gravity = Gravity.CENTER
+            col.addView(viaView, lp(MATCH, WRAP, 4, 0f))
+        }
 
         val statusLine = when (phase) {
             Phase.OUTGOING -> "Calling..."
             Phase.INCOMING -> "Incoming call"
+            Phase.RELAY -> "Passing the call along. Keep this phone here."
             else -> "00:00"
         }
         val statusView = label(statusLine, 18f, colorMuted, false)
@@ -523,7 +648,7 @@ class MainActivity : AppCompatActivity() {
             col.addView(row, lp(MATCH, WRAP, 16, 0f))
         } else {
             col.addView(
-                pill("Hang up", colorDanger, Color.WHITE) {
+                pill(if (phase == Phase.RELAY) "Stop relaying" else "Hang up", colorDanger, Color.WHITE) {
                     sendToService(CallService.ACTION_HANGUP, null)
                 },
                 lp(MATCH, WRAP, 16, 0f)

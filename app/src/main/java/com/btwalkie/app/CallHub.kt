@@ -9,7 +9,7 @@ import java.util.Locale
 import java.util.concurrent.CopyOnWriteArrayList
 
 /** What the phone is doing right now. */
-enum class Phase { IDLE, OUTGOING, INCOMING, ACTIVE }
+enum class Phase { IDLE, OUTGOING, INCOMING, ACTIVE, RELAY }
 
 /**
  * Shared state between the background service (which owns the call) and the screen.
@@ -19,6 +19,7 @@ enum class Phase { IDLE, OUTGOING, INCOMING, ACTIVE }
 object CallHub {
     @Volatile var phase: Phase = Phase.IDLE
     @Volatile var peerName: String = ""
+    @Volatile var via: String = "" // e.g. "via Redmi 9" for a long range call
     @Volatile var startedAt: Long = 0L
     @Volatile var message: String = ""
     @Volatile var listening: Boolean = false

@@ -11,8 +11,8 @@ android {
         applicationId = "com.btwalkie.app"
         minSdk = 24
         targetSdk = 34
-        versionCode = 4
-        versionName = "2.2"
+        versionCode = 5
+        versionName = "2.3"
     }
 
     // A fixed signing key, so a newer APK installs over an older one without uninstalling.
