@@ -131,6 +131,9 @@ class CallService : Service() {
     @Volatile private var serverSocket: BluetoothServerSocket? = null
     @Volatile private var callSocket: BluetoothSocket? = null
     @Volatile private var callEpoch = 0 // changes whenever a call starts or ends
+    @Volatile private var foregroundStarted = false
+    @Volatile private var relistenNow = false
+    private var listenThread: Thread? = null
 
     private var wakeLock: PowerManager.WakeLock? = null
     private var ringtone: Ringtone? = null
@@ -148,6 +151,8 @@ class CallService : Service() {
         notifications = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         adapter = (getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager).adapter
         createChannels()
+        CallHub.init(this)
+        CallHub.log("Service created")
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -155,14 +160,15 @@ class CallService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         goForeground()
         val action = intent?.action
+        CallHub.log("Command: " + (action ?: "restart"))
         if (action == ACTION_STOP) {
             CallHub.setEnabled(this, false)
             shutdown()
             return START_NOT_STICKY
         }
-        if (!running) {
-            running = true
-            startListening()
+        running = true
+        if (listenThread?.isAlive != true) {
+            startListening() // also revives a listener that has died
         }
         when (action) {
             ACTION_CALL -> {
@@ -288,11 +294,16 @@ class CallService : Service() {
         val n = buildStatusNotification()
         try {
             ServiceCompat.startForeground(this, FG_ID, n, foregroundType(withMic))
+            foregroundStarted = true
         } catch (e: Exception) {
+            CallHub.log("Foreground (mic=" + withMic + ") failed: " + e.javaClass.simpleName)
             try {
                 ServiceCompat.startForeground(this, FG_ID, n, foregroundType(false))
+                foregroundStarted = true
             } catch (e2: Exception) {
-                stopSelf()
+                CallHub.log("Foreground failed: " + e2.javaClass.simpleName + " " + e2.message)
+                // Never stop a listener that is already running just because a refresh failed.
+                if (!foregroundStarted) stopSelf()
             }
         }
     }
@@ -335,40 +346,66 @@ class CallService : Service() {
     // ---------------------------------------------------------------- waiting for calls
 
     private fun startListening() {
-        Thread { listenLoop() }.start()
+        val t = Thread { listenLoop() }
+        listenThread = t
+        t.start()
     }
 
     private fun listenLoop() {
-        while (running) {
-            val bt = adapter
-            if (bt == null || !bt.isEnabled || !hasBtPermission()) {
-                setListening(false)
-                sleepQuietly(2000)
-                continue
-            }
-            var server: BluetoothServerSocket? = null
-            try {
-                server = bt.listenUsingRfcommWithServiceRecord("BtWalkie", APP_UUID)
-                serverSocket = server
-                setListening(true)
-                while (running) {
-                    val s = server.accept() // blocks until another phone connects
-                    onIncomingSocket(s)
+        try {
+            while (running) {
+                val bt = adapter
+                if (bt == null || !bt.isEnabled || !hasBtPermission()) {
+                    setListening(false)
+                    sleepQuietly(2000)
+                    continue
                 }
-            } catch (e: IOException) {
-                // Bluetooth was switched off or the socket broke; try again below.
-            } catch (e: SecurityException) {
-                // permission was taken away; try again below.
-            } finally {
+                var server: BluetoothServerSocket? = null
                 try {
-                    server?.close()
+                    server = bt.listenUsingRfcommWithServiceRecord("BtWalkie", APP_UUID)
+                    serverSocket = server
+                    relistenNow = false
+                    setListening(true)
+                    CallHub.log("Listening for calls")
+                    while (running) {
+                        val s = server.accept() // blocks until another phone connects
+                        CallHub.log("Connection from " + nameOf(s.remoteDevice))
+                        try {
+                            onIncomingSocket(s)
+                        } catch (e: Exception) {
+                            CallHub.log("Incoming error: " + e.javaClass.simpleName + " " + e.message)
+                        }
+                    }
                 } catch (e: IOException) {
-                    // ignore
+                    CallHub.log("Listening stopped: " + e.message)
+                } catch (e: SecurityException) {
+                    CallHub.log("Listening blocked: permission")
+                } catch (e: Exception) {
+                    CallHub.log("Listening error: " + e.javaClass.simpleName + " " + e.message)
+                } finally {
+                    try {
+                        server?.close()
+                    } catch (e: IOException) {
+                        // ignore
+                    }
+                    serverSocket = null
+                    setListening(false)
                 }
-                serverSocket = null
-                setListening(false)
+                if (running && !relistenNow) sleepQuietly(1500)
+                relistenNow = false
             }
-            if (running) sleepQuietly(1500)
+        } finally {
+            CallHub.log("Listener thread ended")
+        }
+    }
+
+    /** Re-opens the listening socket so the next call always finds a fresh, working one. */
+    private fun restartServer() {
+        relistenNow = true
+        try {
+            serverSocket?.close()
+        } catch (e: IOException) {
+            // ignore
         }
     }
 
@@ -400,6 +437,7 @@ class CallService : Service() {
         }
         if (epoch < 0) {
             // Already busy: tell the caller and hang up on them.
+            CallHub.log("Refused a call: busy (" + CallHub.phase + ")")
             Thread {
                 try {
                     s.outputStream.write(MSG_BUSY)
@@ -416,6 +454,8 @@ class CallService : Service() {
             }.start()
             return
         }
+        // If the other phone never says hello, free this connection after 8 seconds.
+        scheduleTimeout(epoch, 8000, "")
         Thread { runIncoming(s, epoch) }.start()
     }
 
@@ -438,6 +478,7 @@ class CallService : Service() {
                 }
             }
             if (!ok) return
+            CallHub.log("Incoming call from " + CallHub.peerName + ", ringing")
             startRinging()
             showIncomingNotification()
             refreshStatus()
@@ -447,6 +488,9 @@ class CallService : Service() {
             endCall(epoch, endedByOtherMessage())
         } catch (e: IOException) {
             endCall(epoch, endedByOtherMessage())
+        } catch (e: Exception) {
+            CallHub.log("Incoming error: " + e.javaClass.simpleName + " " + e.message)
+            endCall(epoch, "Call failed")
         }
     }
 
@@ -473,7 +517,12 @@ class CallService : Service() {
             return
         }
         val epoch = synchronized(lock) {
-            if (CallHub.phase != Phase.IDLE || callSocket != null) return
+            if (CallHub.phase != Phase.IDLE || callSocket != null) {
+                CallHub.message = "Please wait a moment, the last call is still closing."
+                CallHub.log("Call refused: phase " + CallHub.phase + ", socket " + (callSocket != null))
+                CallHub.changed()
+                return
+            }
             callEpoch++
             CallHub.phase = Phase.OUTGOING
             CallHub.peerName = nameOf(device)
@@ -482,6 +531,7 @@ class CallService : Service() {
             CallHub.speaker = false
             callEpoch
         }
+        CallHub.log("Calling " + CallHub.peerName)
         goForeground()
         startRingback()
         CallHub.changed()
@@ -511,9 +561,15 @@ class CallService : Service() {
                 sock = candidate
                 break
             } catch (e: IOException) {
+                CallHub.log("Connect attempt " + (attempt + 1) + " failed: " + e.message)
                 try {
                     callSocket?.close()
                 } catch (e2: IOException) {
+                    // ignore
+                }
+                try {
+                    device.fetchUuidsWithSdp() // refresh what the other phone offers
+                } catch (e3: Exception) {
                     // ignore
                 }
                 sleepQuietly(1500)
@@ -522,6 +578,7 @@ class CallService : Service() {
         }
         val s = sock
         if (s == null) {
+            CallHub.log("Could not connect after " + attempt + " attempts")
             endCall(epoch, "Could not connect. Is Bluetooth on and BT Walkie installed on the other phone?")
             return
         }
@@ -559,6 +616,9 @@ class CallService : Service() {
                 epoch,
                 if (CallHub.phase == Phase.ACTIVE) "Call ended" else "Could not reach the other phone"
             )
+        } catch (e: Exception) {
+            CallHub.log("Outgoing error: " + e.javaClass.simpleName + " " + e.message)
+            endCall(epoch, "Call failed")
         }
     }
 
@@ -576,6 +636,7 @@ class CallService : Service() {
         }
         val sock = picked.first
         val epoch = picked.second
+        CallHub.log("Call accepted")
         cancelTimeout()
         stopRinging()
         notifications.cancel(INCOMING_ID)
@@ -634,6 +695,7 @@ class CallService : Service() {
             CallHub.message = message
             CallHub.startedAt = 0L
         }
+        CallHub.log("Call ended" + (if (message.isEmpty()) "" else ": " + message))
         try {
             sock?.close()
         } catch (e: IOException) {
@@ -653,6 +715,7 @@ class CallService : Service() {
         CallHub.muted = false
         CallHub.speaker = false
         if (running) {
+            restartServer() // fresh listening socket for the next call
             goForeground() // drop microphone rights
             if (!CallHub.isEnabled(this)) {
                 // The user turned "Receive calls" off; this service only ran for one outgoing call.

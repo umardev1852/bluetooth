@@ -58,6 +58,7 @@ class MainActivity : AppCompatActivity() {
     private val ui = Handler(Looper.getMainLooper())
     private val listener: () -> Unit = { render() }
     private var timerView: TextView? = null
+    private var showLog = false
 
     private val tick = object : Runnable {
         override fun run() {
@@ -77,6 +78,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        CallHub.init(this)
         volumeControlStream = AudioManager.STREAM_VOICE_CALL // volume keys change call volume
         window.statusBarColor = colorBg
         window.navigationBarColor = colorBg
@@ -363,6 +365,21 @@ class MainActivity : AppCompatActivity() {
             pill("Fix: calls not ringing when app is closed", colorOff, Color.WHITE) { openAutostartSettings() },
             lp(MATCH, WRAP, 10, 0f)
         )
+        col.addView(
+            pill(if (showLog) "Hide debug log" else "Show debug log", colorOff, Color.WHITE) {
+                showLog = !showLog
+                render()
+            },
+            lp(MATCH, WRAP, 10, 0f)
+        )
+        if (showLog) {
+            val logView = label(CallHub.logText(), 11f, colorMuted, false)
+            logView.typeface = Typeface.MONOSPACE
+            logView.setTextIsSelectable(true)
+            logView.setPadding(dp(12), dp(10), dp(12), dp(10))
+            logView.background = rounded(colorCard, 12)
+            col.addView(logView, lp(MATCH, WRAP, 10, 0f))
+        }
         val power = getSystemService(Context.POWER_SERVICE) as PowerManager
         if (Build.VERSION.SDK_INT >= 23 && !power.isIgnoringBatteryOptimizations(packageName)) {
             col.addView(

@@ -28,6 +28,7 @@ class BootReceiver : BroadcastReceiver() {
         if (action == BluetoothAdapter.ACTION_STATE_CHANGED &&
             intent?.getIntExtra(BluetoothAdapter.EXTRA_STATE, -1) != BluetoothAdapter.STATE_ON
         ) return
+        CallLog.add(context, "Receiver woke up: " + action.substringAfterLast('.'))
         if (!CallHub.isEnabled(context)) return
         if (Build.VERSION.SDK_INT >= 31 &&
             ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_CONNECT)
@@ -39,7 +40,7 @@ class BootReceiver : BroadcastReceiver() {
                 Intent(context, CallService::class.java).setAction(CallService.ACTION_START)
             )
         } catch (e: Exception) {
-            // The system did not allow it; the app will start listening next time it is opened.
+            CallLog.add(context, "Receiver could not start the service: " + e)
         }
     }
 }
