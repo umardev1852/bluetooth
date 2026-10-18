@@ -1,6 +1,8 @@
 package com.btwalkie.app
 
 import android.Manifest
+import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothDevice
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -8,10 +10,24 @@ import android.content.pm.PackageManager
 import android.os.Build
 import androidx.core.content.ContextCompat
 
-/** Starts the "ready to receive calls" service again after the phone restarts. */
+/**
+ * Starts the "ready to receive calls" service again when:
+ * - the phone restarts,
+ * - the app is updated,
+ * - Bluetooth is switched on,
+ * - another phone connects over Bluetooth (so a call attempt can wake this phone up).
+ */
 class BootReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent?) {
-        if (intent?.action != Intent.ACTION_BOOT_COMPLETED) return
+        val action = intent?.action ?: return
+        val interesting = action == Intent.ACTION_BOOT_COMPLETED ||
+            action == Intent.ACTION_MY_PACKAGE_REPLACED ||
+            action == BluetoothDevice.ACTION_ACL_CONNECTED ||
+            action == BluetoothAdapter.ACTION_STATE_CHANGED
+        if (!interesting) return
+        if (action == BluetoothAdapter.ACTION_STATE_CHANGED &&
+            intent?.getIntExtra(BluetoothAdapter.EXTRA_STATE, -1) != BluetoothAdapter.STATE_ON
+        ) return
         if (!CallHub.isEnabled(context)) return
         if (Build.VERSION.SDK_INT >= 31 &&
             ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_CONNECT)

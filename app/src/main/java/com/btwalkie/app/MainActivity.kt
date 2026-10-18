@@ -6,6 +6,7 @@ import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothClass
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothManager
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -358,6 +359,10 @@ class MainActivity : AppCompatActivity() {
             },
             lp(MATCH, WRAP, 10, 0f)
         )
+        col.addView(
+            pill("Fix: calls not ringing when app is closed", colorOff, Color.WHITE) { openAutostartSettings() },
+            lp(MATCH, WRAP, 10, 0f)
+        )
         val power = getSystemService(Context.POWER_SERVICE) as PowerManager
         if (Build.VERSION.SDK_INT >= 23 && !power.isIgnoringBatteryOptimizations(packageName)) {
             col.addView(
@@ -368,7 +373,7 @@ class MainActivity : AppCompatActivity() {
 
         col.addView(
             label(
-                "Tip: keep Bluetooth on. The other phone rings even if this app is closed or the screen is off. " +
+                "Tip: open this app once on both phones after installing. After that, keep Bluetooth on: the other phone rings even if the app is closed or the screen is off. " +
                     "Range is about 10 metres.",
                 13f, colorMuted, false
             ),
@@ -377,6 +382,37 @@ class MainActivity : AppCompatActivity() {
 
         scroll.addView(col)
         return scroll
+    }
+
+    /** Opens the phone maker's "auto start" page if it has one (Xiaomi, Oppo, Vivo, Huawei, Tecno...). */
+    private fun openAutostartSettings() {
+        toast("Find BT Walkie and turn on Autostart / Allow background activity.")
+        val candidates = listOf(
+            Pair("com.miui.securitycenter", "com.miui.permcenter.autostart.AutoStartManagementActivity"),
+            Pair("com.coloros.safecenter", "com.coloros.safecenter.permission.startup.StartupAppListActivity"),
+            Pair("com.oppo.safe", "com.oppo.safe.permission.startup.StartupAppListActivity"),
+            Pair("com.vivo.permissionmanager", "com.vivo.permissionmanager.activity.BgStartUpManagerActivity"),
+            Pair("com.iqoo.secure", "com.iqoo.secure.ui.phoneoptimize.AddWhiteListActivity"),
+            Pair("com.huawei.systemmanager", "com.huawei.systemmanager.startupmgr.ui.StartupNormalAppListActivity"),
+            Pair("com.transsion.phonemaster", "com.cyin.himgr.autostart.AutoStartActivity")
+        )
+        for (c in candidates) {
+            try {
+                val i = Intent()
+                i.component = ComponentName(c.first, c.second)
+                startActivity(i)
+                return
+            } catch (e: Exception) {
+                // this phone does not have that page; try the next one
+            }
+        }
+        try {
+            val i = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS)
+            i.data = Uri.parse("package:$packageName")
+            startActivity(i)
+        } catch (e: Exception) {
+            // ignore
+        }
     }
 
     @SuppressLint("BatteryLife")

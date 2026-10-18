@@ -490,7 +490,9 @@ class CallService : Service() {
 
     private fun runOutgoing(device: BluetoothDevice, epoch: Int) {
         var sock: BluetoothSocket? = null
-        for (attempt in 0 until 2) {
+        val began = System.currentTimeMillis()
+        var attempt = 0
+        while (attempt < 6 && System.currentTimeMillis() - began < 20000) {
             if (!isCurrent(epoch)) return
             try {
                 val candidate = device.createRfcommSocketToServiceRecord(APP_UUID)
@@ -509,8 +511,14 @@ class CallService : Service() {
                 sock = candidate
                 break
             } catch (e: IOException) {
-                if (attempt == 0) sleepQuietly(700)
+                try {
+                    callSocket?.close()
+                } catch (e2: IOException) {
+                    // ignore
+                }
+                sleepQuietly(1500)
             }
+            attempt++
         }
         val s = sock
         if (s == null) {
